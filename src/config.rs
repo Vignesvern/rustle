@@ -1,7 +1,7 @@
 //! Runtime configuration, read from environment variables with sensible defaults.
 //!
-//! Every knob has a `RUSTLE_*` env var and a default, so the server runs with zero
-//! configuration but is fully tunable in production without recompiling.
+//! Every knob has an env var and a default, so the server runs with zero configuration
+//! but is fully tunable in production without recompiling.
 
 use std::time::Duration;
 
@@ -9,6 +9,10 @@ use std::time::Duration;
 pub struct Config {
     /// Address to bind, e.g. "0.0.0.0:3000".
     pub addr: String,
+    /// Postgres connection string. If `None`, the server runs without persistence.
+    pub database_url: Option<String>,
+    /// How many recent messages to replay to a client when it joins a room.
+    pub history_limit: usize,
     /// Maximum size of a single chat message body, in bytes.
     pub max_message_bytes: usize,
     /// Maximum length (in characters) of a display name.
@@ -27,6 +31,8 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             addr: "0.0.0.0:3000".to_owned(),
+            database_url: None,
+            history_limit: 50,
             max_message_bytes: 4096,
             max_name_len: 24,
             max_room_len: 24,
@@ -43,6 +49,8 @@ impl Config {
         let d = Self::default();
         Self {
             addr: env_or("RUSTLE_ADDR", d.addr),
+            database_url: std::env::var("DATABASE_URL").ok(),
+            history_limit: env_or("RUSTLE_HISTORY_LIMIT", d.history_limit),
             max_message_bytes: env_or("RUSTLE_MAX_MESSAGE_BYTES", d.max_message_bytes),
             max_name_len: env_or("RUSTLE_MAX_NAME_LEN", d.max_name_len),
             max_room_len: env_or("RUSTLE_MAX_ROOM_LEN", d.max_room_len),

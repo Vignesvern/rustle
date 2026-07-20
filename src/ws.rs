@@ -7,9 +7,12 @@
 //!
 //! Each client runs two tasks:
 //! 1. write task: the room broadcast *and* a private notice channel are drained into the
-//!    client's socket (the private channel carries per-client warnings).
+//!    client's socket.
 //! 2. read task: the client's socket is drained into the room broadcast, subject to a
-//!    message-size cap and a per-connection rate limit.
+//!    size cap and a per-connection rate limit, and (if configured) persisted to Postgres.
+//!
+//! On join we replay recent history from the database to just this client before live
+//! traffic begins.
 
 use std::time::{Duration, Instant};
 
@@ -46,7 +49,6 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     match validate_join(&room, &name, &config) {
                         Ok(pair) => break pair,
                         Err(reason) => {
-                            // Tell the client why we're rejecting, then close.
                             let msg = ServerMessage::system("", reason);
                             if let Ok(json) = serde_json::to_string(&msg) {
                                 let _ = sink.send(Message::Text(json.into())).await;
@@ -65,6 +67,24 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
     let (mut rx, roster) = state.hub.join(&room, conn_id, name.clone());
     tracing::info!(%name, %room, "client joined");
 
+    // Replay recent history to *this* client before live traffic starts.
+    if let Some(pool) = &state.db {
+        match crate::db::recent_history(pool, &room, config.history_limit).await {
+            Ok(history) => {
+                for msg in history {
+                    if let Ok(json) = serde_json::to_string(&msg)
+                        && sink.send(Message::Text(json.into())).await.is_err()
+                    {
+                        // Client vanished mid-replay: unregister and bail.
+                        state.hub.leave(&room, conn_id);
+                        return;
+                    }
+                }
+            }
+            Err(e) => tracing::warn!(error = %e, "failed to load history"),
+        }
+    }
+
     state.hub.broadcast(
         &room,
         ServerMessage::system(&room, format!("{name} joined")),
@@ -80,9 +100,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
     let mut write_task = tokio::spawn(async move {
         loop {
             let msg = tokio::select! {
-                // A private notice destined only for this client.
                 Some(note) = notify_rx.recv() => note,
-                // A room broadcast. Skip lagged messages; stop when the channel closes.
                 r = rx.recv() => match r {
                     Ok(msg) => msg,
                     Err(RecvError::Lagged(_)) => continue,
@@ -98,8 +116,9 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
         }
     });
 
-    // --- Read task: this browser -> room broadcast (size cap + rate limit) ------------
+    // --- Read task: this browser -> room broadcast (size cap + rate limit + persist) --
     let hub = state.hub.clone();
+    let db = state.db.clone();
     let read_room = room.clone();
     let author = name.clone();
     let max_bytes = config.max_message_bytes;
@@ -128,15 +147,22 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     let _ = notify_tx.send(note).await;
                     continue;
                 }
+
                 hub.broadcast(
                     &read_room,
                     ServerMessage::chat(&read_room, author.clone(), body),
                 );
+
+                // Persist after broadcasting so live delivery stays snappy.
+                if let Some(pool) = &db
+                    && let Err(e) = crate::db::insert_message(pool, &read_room, &author, body).await
+                {
+                    tracing::warn!(error = %e, "failed to persist message");
+                }
             }
         }
     });
 
-    // Whichever task finishes first, abort the other — graceful teardown.
     tokio::select! {
         _ = &mut write_task => read_task.abort(),
         _ = &mut read_task => write_task.abort(),

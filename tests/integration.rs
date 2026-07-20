@@ -20,7 +20,12 @@ type Ws = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
 /// Start the server on a random free port and return its address.
 async fn spawn(config: Config) -> SocketAddr {
-    let app = build_app(AppState::new(config));
+    spawn_state(AppState::new(config)).await
+}
+
+/// Start the server from a prebuilt state (e.g. one carrying a database pool).
+async fn spawn_state(state: AppState) -> SocketAddr {
+    let app = build_app(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
@@ -260,4 +265,49 @@ async fn list_rooms_reflects_membership() {
     assert_eq!(v[0]["count"], 2);
     assert_eq!(v[1]["name"], "random");
     assert_eq!(v[1]["count"], 1);
+}
+
+// --- Persistence (runs only when DATABASE_URL is set) ------------------------------
+
+#[tokio::test]
+async fn history_is_replayed_on_join() {
+    let Ok(url) = std::env::var("DATABASE_URL") else {
+        eprintln!("skipping history_is_replayed_on_join: DATABASE_URL not set");
+        return;
+    };
+
+    let pool = rustle::db::init(&url).await.expect("db init + migrate");
+    let room = "hist-test-room";
+    // Start from a clean slate for this room.
+    sqlx::query("DELETE FROM messages WHERE room = $1")
+        .bind(room)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let state = AppState::new(Config::default()).with_db(Some(pool.clone()));
+    let addr = spawn_state(state).await;
+
+    // Alice joins, posts two messages, then leaves.
+    let mut alice = join(addr, room, "alice").await;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    send_msg(&mut alice, "first").await;
+    send_msg(&mut alice, "second").await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    alice.close(None).await.unwrap();
+
+    // Bob joins later and should receive both historical messages, in order.
+    let mut bob = join(addr, room, "bob").await;
+    let first = recv_until(&mut bob, |m| is_msg(m, "first")).await;
+    let second = recv_until(&mut bob, |m| is_msg(m, "second")).await;
+    assert!(first.is_some(), "history: 'first' should be replayed");
+    assert!(second.is_some(), "history: 'second' should be replayed");
+    assert_eq!(first.unwrap()["name"], "alice");
+
+    let _ = bob.close(None).await;
+    sqlx::query("DELETE FROM messages WHERE room = $1")
+        .bind(room)
+        .execute(&pool)
+        .await
+        .unwrap();
 }
