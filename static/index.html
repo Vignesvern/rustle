@@ -12,17 +12,26 @@
     header { padding:14px 20px; background:var(--panel); border-bottom:1px solid #222; font-weight:600; }
     header .dot { color:var(--accent); }
     #status { float:right; font-weight:400; font-size:13px; color:var(--muted); }
+    #main { flex:1; display:flex; min-height:0; }
     #log { flex:1; overflow-y:auto; padding:16px 20px; display:flex; flex-direction:column; gap:8px; }
-    .msg { max-width:70%; }
+    #sidebar { width:200px; background:var(--panel); border-left:1px solid #222; padding:16px;
+               overflow-y:auto; }
+    #sidebar h2 { font-size:12px; text-transform:uppercase; letter-spacing:.05em;
+                  color:var(--muted); margin:0 0 10px; }
+    #users { list-style:none; margin:0; padding:0; display:flex; flex-direction:column; gap:6px; }
+    #users li { font-size:14px; display:flex; align-items:center; gap:8px; }
+    #users li::before { content:''; width:8px; height:8px; border-radius:50%; background:#3fb950; }
+    .msg { max-width:75%; }
     .msg .name { font-size:12px; color:var(--accent); margin-bottom:2px; }
     .msg .body { background:var(--panel); padding:8px 12px; border-radius:10px;
                  display:inline-block; word-wrap:break-word; white-space:pre-wrap; }
     .msg.me { align-self:flex-end; text-align:right; }
     .msg.me .body { background:var(--accent); color:#111; }
     .system { align-self:center; font-size:12px; color:var(--muted); font-style:italic; }
-    form { display:flex; gap:8px; padding:12px 20px; background:var(--panel); border-top:1px solid #222; }
-    input { flex:1; padding:10px 12px; border-radius:8px; border:1px solid #2a2e37;
+    form#composer { display:flex; gap:8px; padding:12px 20px; background:var(--panel); border-top:1px solid #222; }
+    input { padding:10px 12px; border-radius:8px; border:1px solid #2a2e37;
             background:#0d0f13; color:var(--text); font-size:14px; }
+    #composer input { flex:1; }
     button { padding:10px 18px; border:0; border-radius:8px; background:var(--accent);
              color:#111; font-weight:600; cursor:pointer; }
     button:disabled { opacity:.5; cursor:not-allowed; }
@@ -31,12 +40,19 @@
     #gate .card { background:var(--panel); padding:28px; border-radius:14px; width:320px; text-align:center; }
     #gate h1 { margin:0 0 4px; }
     #gate p { color:var(--muted); margin:0 0 18px; font-size:14px; }
-    #gate form { padding:0; background:none; border:0; flex-direction:column; }
+    #gate form { display:flex; flex-direction:column; gap:10px; }
+    #gate input { width:100%; }
   </style>
 </head>
 <body>
   <header>rustle <span class="dot">&#9679;</span> <span id="room">#general</span><span id="status">connecting&hellip;</span></header>
-  <div id="log"></div>
+  <div id="main">
+    <div id="log"></div>
+    <aside id="sidebar">
+      <h2>Online &middot; <span id="count">0</span></h2>
+      <ul id="users"></ul>
+    </aside>
+  </div>
   <form id="composer">
     <input id="input" autocomplete="off" placeholder="Type a message&hellip;" disabled>
     <button id="send" disabled>Send</button>
@@ -45,25 +61,22 @@
   <div id="gate">
     <div class="card">
       <h1>rustle</h1>
-      <p>Pick a name to join the room.</p>
+      <p>Pick a name and a room to join.</p>
       <form id="joinForm">
         <input id="nameInput" autocomplete="off" placeholder="Your name" maxlength="24" required>
-        <button type="submit" style="margin-top:12px">Join chat</button>
+        <input id="roomInput" autocomplete="off" placeholder="Room (e.g. general)" maxlength="24" value="general">
+        <button type="submit">Join chat</button>
       </form>
     </div>
   </div>
 
   <script>
-    const log = document.getElementById('log');
-    const status = document.getElementById('status');
-    const composer = document.getElementById('composer');
-    const input = document.getElementById('input');
-    const sendBtn = document.getElementById('send');
-    const gate = document.getElementById('gate');
-    const joinForm = document.getElementById('joinForm');
-    const nameInput = document.getElementById('nameInput');
+    const $ = (id) => document.getElementById(id);
+    const log = $('log'), status = $('status'), users = $('users'), count = $('count');
+    const composer = $('composer'), input = $('input'), sendBtn = $('send');
+    const gate = $('gate'), joinForm = $('joinForm'), nameInput = $('nameInput'), roomInput = $('roomInput');
 
-    let ws, myName;
+    let ws, myName, myRoom;
 
     const escapeHtml = (s) => s.replace(/[&<>"']/g,
       c => ({ '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;' }[c]));
@@ -87,9 +100,20 @@
       log.scrollTop = log.scrollHeight;
     }
 
+    function renderUsers(list) {
+      count.textContent = list.length;
+      users.innerHTML = '';
+      for (const u of list) {
+        const li = document.createElement('li');
+        li.textContent = u;
+        users.appendChild(li);
+      }
+    }
+
     joinForm.addEventListener('submit', (e) => {
       e.preventDefault();
       myName = nameInput.value.trim();
+      myRoom = (roomInput.value.trim() || 'general');
       if (myName) connect();
     });
 
@@ -99,7 +123,8 @@
 
       ws.onopen = () => {
         status.textContent = 'connected';
-        ws.send(JSON.stringify({ type: 'join', name: myName }));
+        ws.send(JSON.stringify({ type: 'join', room: myRoom, name: myName }));
+        $('room').textContent = '#' + myRoom;
         gate.style.display = 'none';
         input.disabled = false; sendBtn.disabled = false; input.focus();
       };
@@ -107,6 +132,7 @@
         const m = JSON.parse(ev.data);
         if (m.type === 'message') addMessage(m.name, m.body, m.ts, m.name === myName);
         else if (m.type === 'system') addSystem(m.body);
+        else if (m.type === 'presence') renderUsers(m.users);
       };
       ws.onclose = () => {
         status.textContent = 'disconnected';

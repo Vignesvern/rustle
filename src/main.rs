@@ -1,23 +1,24 @@
 //! rustle — a real-time WebSocket chat server.
 //!
-//! M1: a single global room. Every connected browser subscribes to one broadcast
-//! channel; anything one client says is fanned out to all the others.
+//! M2: multiple named rooms with live presence. Each connection joins one room; the
+//! [`Hub`] registry maps room names to per-room broadcast channels and member rosters.
 
+mod hub;
 mod message;
 mod ws;
 
+use std::sync::Arc;
+
 use axum::{Router, routing::get};
-use tokio::sync::broadcast;
 use tower_http::{services::ServeDir, trace::TraceLayer};
 
-use crate::message::ServerMessage;
+use crate::hub::Hub;
 
-/// Shared application state. A `broadcast::Sender` is just an `Arc` inside, so cloning
-/// `AppState` is cheap — which matters because axum hands each request its own clone.
+/// Shared application state. `Arc<Hub>` is a cheap-to-clone shared pointer to the one
+/// room registry; axum hands each request its own clone.
 #[derive(Clone)]
 pub struct AppState {
-    /// The single global room's broadcast channel (M1). One sender, many receivers.
-    pub tx: broadcast::Sender<ServerMessage>,
+    pub hub: Arc<Hub>,
 }
 
 #[tokio::main]
@@ -30,10 +31,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .init();
 
-    // The broadcast channel. Capacity (100) is how many messages a slow subscriber may
-    // fall behind before it starts dropping the oldest ones.
-    let (tx, _rx) = broadcast::channel::<ServerMessage>(100);
-    let state = AppState { tx };
+    let state = AppState {
+        hub: Arc::new(Hub::default()),
+    };
 
     // /ws is the WebSocket endpoint; every other path is served from ./static,
     // so GET / returns static/index.html (the chat UI).
