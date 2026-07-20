@@ -1,8 +1,10 @@
 # rustle
 
+[![CI](https://github.com/Vignesvern/rustle/actions/workflows/ci.yml/badge.svg)](https://github.com/Vignesvern/rustle/actions/workflows/ci.yml)
+
 A real-time chat service written in **Rust** — WebSocket-based, with per-room broadcast
 fan-out, live presence, configurable limits, optional Postgres persistence, JWT-based
-accounts, and an integration test suite. Built with
+accounts, Docker packaging, and CI. Built with
 [`axum`](https://github.com/tokio-rs/axum) and [`tokio`](https://tokio.rs).
 
 > Portfolio project. Built incrementally in milestones; see the roadmap below.
@@ -15,34 +17,40 @@ system notices, and a live "online" roster tracks who's present. Messages are si
 and rate-limited per connection. With a database configured, recent history is replayed to
 clients on join, and accounts are persisted.
 
-## Run it
+## Quick start
+
+### With Docker (app + Postgres)
+
+```bash
+docker compose up --build
+# open http://localhost:3000
+```
+
+### From source
 
 ```bash
 cargo run
-# then open http://localhost:3000 — sign up, or "Continue as guest"
+# open http://localhost:3000 — sign up, or "Continue as guest"
 ```
 
-Set `RUST_LOG=rustle=debug` for verbose logs. Without a database it runs fully in-memory
-(guests only; auth endpoints require a database).
-
-### With persistence + accounts (Postgres)
+Without a database it runs fully in-memory (guests only; auth endpoints need a database).
+To enable persistence + accounts from source:
 
 ```bash
-docker compose up -d
+docker compose up -d db
 export DATABASE_URL=postgres://rustle:rustle@localhost:5432/rustle
-export RUSTLE_JWT_SECRET=$(openssl rand -hex 32)   # use a real secret in production
+export RUSTLE_JWT_SECRET=$(openssl rand -hex 32)
 cargo run
 ```
 
 ## Accounts & auth
 
 - `POST /api/register` and `POST /api/login` take `{ "username", "password" }` and return
-  `{ "token", "username" }`. Passwords are hashed with **argon2id** (never stored in the
-  clear); the token is a short-lived **HS256 JWT**.
+  `{ "token", "username" }`. Passwords are hashed with **argon2id**; the token is a
+  short-lived **HS256 JWT**.
 - The WebSocket accepts an optional `?token=<jwt>`. With a valid token, the client's
   identity is taken from the token (it can't be spoofed via the join frame); an invalid
-  token is rejected at the handshake with `401`. With no token, the client is a **guest**
-  and picks a display name.
+  token is rejected with `401`. With no token, the client is a **guest**.
 
 ## How it works
 
@@ -95,7 +103,7 @@ All settings are environment variables with sensible defaults (see [`config.rs`]
 
 | Variable                        | Default | Meaning                                |
 |---------------------------------|---------|----------------------------------------|
-| `RUSTLE_ADDR`                   | `0.0.0.0:3000` | Bind address                    |
+| `RUSTLE_ADDR`                   | `0.0.0.0:3000` | Bind address (Docker image: `:8080`) |
 | `DATABASE_URL`                  | *(unset)* | Postgres URL; unset = no persistence |
 | `RUSTLE_JWT_SECRET`             | *(dev default)* | HS256 signing secret — **set in prod** |
 | `RUSTLE_JWT_TTL_SECS`           | `86400` | Token lifetime                         |
@@ -115,14 +123,29 @@ cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 ```
 
-The suite drives a real server (broadcast, room isolation, presence, rate limiting, size
-limits, auth handshake) and exercises HTTP endpoints via axum's `oneshot`. Persistence and
-account tests run only when `DATABASE_URL` is set (otherwise they skip).
+CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs fmt, clippy, and the full
+test suite against a Postgres service on every push and PR. Persistence and account tests
+run only when `DATABASE_URL` is set (otherwise they skip).
+
+## Deploy (Fly.io)
+
+A [`fly.toml`](fly.toml) template is included. Roughly:
+
+```bash
+fly launch --no-deploy                        # create the app
+fly postgres create && fly postgres attach <db-app>   # provisions DATABASE_URL
+fly secrets set RUSTLE_JWT_SECRET=$(openssl rand -hex 32)
+fly deploy
+```
+
+The multi-stage [`Dockerfile`](Dockerfile) is used for both `docker compose` and the
+Fly deploy; the final image is a slim Debian with just the binary + `static/`.
 
 ## Tech stack
 
 `tokio` · `axum` (WebSockets) · `serde` / `serde_json` · `sqlx` (Postgres) · `argon2` ·
-`jsonwebtoken` · `tracing` · `tower-http` · `thiserror` · `tokio-tungstenite` (tests)
+`jsonwebtoken` · `tracing` · `tower-http` · `thiserror` · `tokio-tungstenite` (tests) ·
+Docker · GitHub Actions
 
 ## Roadmap
 
@@ -131,4 +154,4 @@ account tests run only when `DATABASE_URL` is set (otherwise they skip).
 - [x] **M3** — config, rate limiting, size limits, HTTP API, integration tests
 - [x] **M4** — Postgres persistence + message history
 - [x] **M5** — accounts + JWT auth
-- [ ] **M6** — Docker, CI, deploy
+- [x] **M6** — Docker, CI, deploy

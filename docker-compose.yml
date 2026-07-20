@@ -1,7 +1,6 @@
-# Local development Postgres for rustle.
-#   docker compose up -d
-#   export DATABASE_URL=postgres://rustle:rustle@localhost:5432/rustle
-#   cargo run
+# Full local stack: the app + Postgres.
+#   docker compose up --build
+#   open http://localhost:3000
 services:
   db:
     image: postgres:16
@@ -18,6 +17,19 @@ services:
       interval: 5s
       timeout: 3s
       retries: 5
+
+  app:
+    build: .
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://rustle:rustle@db:5432/rustle
+      RUSTLE_JWT_SECRET: dev-compose-secret-change-me
+      RUSTLE_ADDR: 0.0.0.0:8080
+      RUST_LOG: rustle=info,tower_http=info
+    ports:
+      - "3000:8080"
 
 volumes:
   rustle_pgdata:
