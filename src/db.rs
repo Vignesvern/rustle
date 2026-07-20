@@ -1,8 +1,7 @@
 //! Postgres persistence (optional).
 //!
 //! Uses sqlx's *runtime* query API (not the compile-time `query!` macro), so the crate
-//! builds without a live database. Persistence is only active when `DATABASE_URL` is set;
-//! otherwise the server runs fully in-memory.
+//! builds without a live database.
 
 use sqlx::PgPool;
 use sqlx::postgres::PgPoolOptions;
@@ -25,6 +24,14 @@ struct MessageRow {
     created_at: chrono::DateTime<chrono::Utc>,
 }
 
+/// A user account row.
+#[derive(sqlx::FromRow)]
+pub struct User {
+    pub id: i64,
+    pub username: String,
+    pub password_hash: String,
+}
+
 /// Persist a single chat message.
 pub async fn insert_message(
     pool: &PgPool,
@@ -41,8 +48,7 @@ pub async fn insert_message(
     Ok(())
 }
 
-/// Fetch up to `limit` most-recent messages for a room, in chronological order,
-/// ready to replay to a joining client.
+/// Fetch up to `limit` most-recent messages for a room, in chronological order.
 pub async fn recent_history(
     pool: &PgPool,
     room: &str,
@@ -57,7 +63,6 @@ pub async fn recent_history(
     .fetch_all(pool)
     .await?;
 
-    // Rows came back newest-first; reverse to oldest-first for replay.
     let msgs = rows
         .into_iter()
         .rev()
@@ -69,4 +74,28 @@ pub async fn recent_history(
         })
         .collect();
     Ok(msgs)
+}
+
+/// Create a user. The caller distinguishes a unique-violation (username taken) via
+/// [`sqlx::error::DatabaseError::is_unique_violation`].
+pub async fn create_user(
+    pool: &PgPool,
+    username: &str,
+    password_hash: &str,
+) -> Result<i64, sqlx::Error> {
+    let row: (i64,) =
+        sqlx::query_as("INSERT INTO users (username, password_hash) VALUES ($1, $2) RETURNING id")
+            .bind(username)
+            .bind(password_hash)
+            .fetch_one(pool)
+            .await?;
+    Ok(row.0)
+}
+
+/// Look up a user by username.
+pub async fn find_user(pool: &PgPool, username: &str) -> Result<Option<User>, sqlx::Error> {
+    sqlx::query_as::<_, User>("SELECT id, username, password_hash FROM users WHERE username = $1")
+        .bind(username)
+        .fetch_optional(pool)
+        .await
 }

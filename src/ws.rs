@@ -5,48 +5,67 @@
 //! * A room's `broadcast::Sender` ≈ a Go channel that fans out to *every* subscriber.
 //! * `tokio::spawn` ≈ `go func()`; `tokio::select!` ≈ Go's `select {}`.
 //!
-//! Each client runs two tasks:
-//! 1. write task: the room broadcast *and* a private notice channel are drained into the
-//!    client's socket.
-//! 2. read task: the client's socket is drained into the room broadcast, subject to a
-//!    size cap and a per-connection rate limit, and (if configured) persisted to Postgres.
+//! ## Auth
 //!
-//! On join we replay recent history from the database to just this client before live
-//! traffic begins.
+//! A `?token=<jwt>` query parameter is optional. If absent, the client is a guest and its
+//! display name comes from the `join` frame. If present, it must be valid (else the
+//! upgrade is rejected with 401), and the authenticated username — not any client-supplied
+//! name — is used, so identities can't be spoofed.
 
 use std::time::{Duration, Instant};
 
 use axum::{
     extract::{
-        State,
+        Query, State,
         ws::{Message, WebSocket, WebSocketUpgrade},
     },
-    response::IntoResponse,
+    response::{IntoResponse, Response},
 };
 use futures_util::{SinkExt, StreamExt};
+use serde::Deserialize;
 use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::mpsc;
 
 use crate::AppState;
 use crate::config::Config;
+use crate::error::AppError;
 use crate::message::{ClientMessage, ServerMessage};
 
-/// Axum handler for `GET /ws`: upgrades the connection, then runs `handle_socket`.
-pub async fn ws_handler(ws: WebSocketUpgrade, State(state): State<AppState>) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| handle_socket(socket, state))
+#[derive(Deserialize)]
+pub struct WsQuery {
+    token: Option<String>,
 }
 
-async fn handle_socket(socket: WebSocket, state: AppState) {
+/// Axum handler for `GET /ws`: authenticates (if a token is supplied), then upgrades.
+pub async fn ws_handler(
+    ws: WebSocketUpgrade,
+    Query(query): Query<WsQuery>,
+    State(state): State<AppState>,
+) -> Response {
+    // Resolve the authenticated user, if any. A supplied-but-invalid token is rejected.
+    let auth_user = match query.token {
+        Some(token) => match crate::auth::verify_token(&state.config.jwt_secret, &token) {
+            Some(user) => Some(user),
+            None => return AppError::Unauthorized.into_response(),
+        },
+        None => None,
+    };
+    ws.on_upgrade(move |socket| handle_socket(socket, state, auth_user))
+}
+
+async fn handle_socket(socket: WebSocket, state: AppState, auth_user: Option<String>) {
     let (mut sink, mut stream) = socket.split();
     let config = state.config.clone();
 
-    // The first valid frame must be a `join` with an acceptable room + name.
+    // The first valid frame must be a `join`. For authenticated clients the trusted
+    // username overrides whatever name the client sends.
     let (room, name) = loop {
         match stream.next().await {
             Some(Ok(Message::Text(text))) => {
                 if let Ok(ClientMessage::Join { room, name }) = serde_json::from_str(text.as_str())
                 {
-                    match validate_join(&room, &name, &config) {
+                    let effective_name = auth_user.clone().unwrap_or(name);
+                    match validate_join(&room, &effective_name, &config) {
                         Ok(pair) => break pair,
                         Err(reason) => {
                             let msg = ServerMessage::system("", reason);
@@ -65,7 +84,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
 
     let conn_id = state.hub.next_conn_id();
     let (mut rx, roster) = state.hub.join(&room, conn_id, name.clone());
-    tracing::info!(%name, %room, "client joined");
+    tracing::info!(%name, %room, authenticated = auth_user.is_some(), "client joined");
 
     // Replay recent history to *this* client before live traffic starts.
     if let Some(pool) = &state.db {
@@ -75,7 +94,6 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     if let Ok(json) = serde_json::to_string(&msg)
                         && sink.send(Message::Text(json.into())).await.is_err()
                     {
-                        // Client vanished mid-replay: unregister and bail.
                         state.hub.leave(&room, conn_id);
                         return;
                     }
@@ -153,7 +171,6 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     ServerMessage::chat(&read_room, author.clone(), body),
                 );
 
-                // Persist after broadcasting so live delivery stays snappy.
                 if let Some(pool) = &db
                     && let Err(e) = crate::db::insert_message(pool, &read_room, &author, body).await
                 {

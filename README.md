@@ -1,39 +1,48 @@
 # rustle
 
 A real-time chat service written in **Rust** — WebSocket-based, with per-room broadcast
-fan-out, live presence, configurable limits, optional Postgres persistence, and an
-integration test suite. Built with [`axum`](https://github.com/tokio-rs/axum) and
-[`tokio`](https://tokio.rs).
+fan-out, live presence, configurable limits, optional Postgres persistence, JWT-based
+accounts, and an integration test suite. Built with
+[`axum`](https://github.com/tokio-rs/axum) and [`tokio`](https://tokio.rs).
 
 > Portfolio project. Built incrementally in milestones; see the roadmap below.
 
 ## What it does
 
-Open the app in two browser tabs, pick a name and a room, and chat in real time.
+Open the app, sign in (or continue as a guest), pick a room, and chat in real time.
 Messages are fanned out to everyone **in the same room**; join/leave events show up as
 system notices, and a live "online" roster tracks who's present. Messages are size-capped
 and rate-limited per connection. With a database configured, recent history is replayed to
-clients when they join.
+clients on join, and accounts are persisted.
 
 ## Run it
 
 ```bash
 cargo run
-# then open http://localhost:3000 in two browser tabs
+# then open http://localhost:3000 — sign up, or "Continue as guest"
 ```
 
-Set `RUST_LOG=rustle=debug` for verbose logs. Without a database it runs fully in-memory.
+Set `RUST_LOG=rustle=debug` for verbose logs. Without a database it runs fully in-memory
+(guests only; auth endpoints require a database).
 
-### With persistence (Postgres)
+### With persistence + accounts (Postgres)
 
 ```bash
 docker compose up -d
 export DATABASE_URL=postgres://rustle:rustle@localhost:5432/rustle
+export RUSTLE_JWT_SECRET=$(openssl rand -hex 32)   # use a real secret in production
 cargo run
 ```
 
-Migrations in [`migrations/`](migrations/) run automatically on startup. Recent messages
-are then replayed to clients on join (up to `RUSTLE_HISTORY_LIMIT`).
+## Accounts & auth
+
+- `POST /api/register` and `POST /api/login` take `{ "username", "password" }` and return
+  `{ "token", "username" }`. Passwords are hashed with **argon2id** (never stored in the
+  clear); the token is a short-lived **HS256 JWT**.
+- The WebSocket accepts an optional `?token=<jwt>`. With a valid token, the client's
+  identity is taken from the token (it can't be spoofed via the join frame); an invalid
+  token is rejected at the handshake with `401`. With no token, the client is a **guest**
+  and picks a display name.
 
 ## How it works
 
@@ -52,20 +61,16 @@ via `Arc`. Each connection runs **two async tasks**:
 aborted, the member is removed (empty rooms are pruned), and a refreshed roster is
 broadcast to whoever remains.
 
-```
-browser ──ws──▶ read task ──▶ room broadcast::Sender ──▶ write task ──ws──▶ same-room browsers
-                    │
-                    └──▶ Postgres (optional): persist + replay recent history on join
-```
-
 ## HTTP API
 
-| Method | Path               | Description                         |
-|--------|--------------------|-------------------------------------|
-| GET    | `/health`          | Liveness probe (returns `ok`)       |
-| GET    | `/api/rooms`       | List active rooms + member counts   |
-| GET    | `/api/rooms/{name}`| A room's roster, or `404` if unknown|
-| GET    | `/ws`              | WebSocket endpoint                  |
+| Method | Path               | Description                              |
+|--------|--------------------|------------------------------------------|
+| POST   | `/api/register`    | Create an account → `{ token, username }`|
+| POST   | `/api/login`       | Log in → `{ token, username }`           |
+| GET    | `/health`          | Liveness probe (returns `ok`)            |
+| GET    | `/api/rooms`       | List active rooms + member counts        |
+| GET    | `/api/rooms/{name}`| A room's roster, or `404` if unknown     |
+| GET    | `/ws`              | WebSocket endpoint (optional `?token=`)  |
 
 ## Wire protocol (JSON over WebSocket)
 
@@ -92,6 +97,8 @@ All settings are environment variables with sensible defaults (see [`config.rs`]
 |---------------------------------|---------|----------------------------------------|
 | `RUSTLE_ADDR`                   | `0.0.0.0:3000` | Bind address                    |
 | `DATABASE_URL`                  | *(unset)* | Postgres URL; unset = no persistence |
+| `RUSTLE_JWT_SECRET`             | *(dev default)* | HS256 signing secret — **set in prod** |
+| `RUSTLE_JWT_TTL_SECS`           | `86400` | Token lifetime                         |
 | `RUSTLE_HISTORY_LIMIT`          | `50`    | Messages replayed to a client on join  |
 | `RUSTLE_MAX_MESSAGE_BYTES`      | `4096`  | Max chat message size                  |
 | `RUSTLE_MAX_NAME_LEN`           | `24`    | Max display-name length (chars)        |
@@ -108,15 +115,14 @@ cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 ```
 
-The suite spins up the server on an ephemeral port and drives it with real
-`tokio-tungstenite` clients (broadcast, room isolation, presence, rate limiting, size
-limits) and exercises the HTTP endpoints via axum's `oneshot`. The persistence test runs
-only when `DATABASE_URL` is set (otherwise it skips).
+The suite drives a real server (broadcast, room isolation, presence, rate limiting, size
+limits, auth handshake) and exercises HTTP endpoints via axum's `oneshot`. Persistence and
+account tests run only when `DATABASE_URL` is set (otherwise they skip).
 
 ## Tech stack
 
-`tokio` · `axum` (WebSockets) · `serde` / `serde_json` · `sqlx` (Postgres) · `tracing` ·
-`tower-http` · `thiserror` · `tokio-tungstenite` (tests)
+`tokio` · `axum` (WebSockets) · `serde` / `serde_json` · `sqlx` (Postgres) · `argon2` ·
+`jsonwebtoken` · `tracing` · `tower-http` · `thiserror` · `tokio-tungstenite` (tests)
 
 ## Roadmap
 
@@ -124,5 +130,5 @@ only when `DATABASE_URL` is set (otherwise it skips).
 - [x] **M2** — multiple rooms + presence
 - [x] **M3** — config, rate limiting, size limits, HTTP API, integration tests
 - [x] **M4** — Postgres persistence + message history
-- [ ] **M5** — accounts + JWT auth
+- [x] **M5** — accounts + JWT auth
 - [ ] **M6** — Docker, CI, deploy

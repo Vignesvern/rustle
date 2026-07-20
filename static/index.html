@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>rustle</title>
   <style>
-    :root { --bg:#0f1115; --panel:#171a21; --accent:#e2703a; --text:#e6e6e6; --muted:#8a8f98; }
+    :root { --bg:#0f1115; --panel:#171a21; --accent:#e2703a; --text:#e6e6e6; --muted:#8a8f98; --err:#e5534b; }
     * { box-sizing: border-box; }
     body { margin:0; font-family: system-ui, -apple-system, sans-serif; background:var(--bg);
            color:var(--text); height:100vh; display:flex; flex-direction:column; }
@@ -14,38 +14,36 @@
     #status { float:right; font-weight:400; font-size:13px; color:var(--muted); }
     #main { flex:1; display:flex; min-height:0; }
     #log { flex:1; overflow-y:auto; padding:16px 20px; display:flex; flex-direction:column; gap:8px; }
-    #sidebar { width:200px; background:var(--panel); border-left:1px solid #222; padding:16px;
-               overflow-y:auto; }
-    #sidebar h2 { font-size:12px; text-transform:uppercase; letter-spacing:.05em;
-                  color:var(--muted); margin:0 0 10px; }
+    #sidebar { width:200px; background:var(--panel); border-left:1px solid #222; padding:16px; overflow-y:auto; }
+    #sidebar h2 { font-size:12px; text-transform:uppercase; letter-spacing:.05em; color:var(--muted); margin:0 0 10px; }
     #users { list-style:none; margin:0; padding:0; display:flex; flex-direction:column; gap:6px; }
     #users li { font-size:14px; display:flex; align-items:center; gap:8px; }
     #users li::before { content:''; width:8px; height:8px; border-radius:50%; background:#3fb950; }
     .msg { max-width:75%; }
     .msg .name { font-size:12px; color:var(--accent); margin-bottom:2px; }
-    .msg .body { background:var(--panel); padding:8px 12px; border-radius:10px;
-                 display:inline-block; word-wrap:break-word; white-space:pre-wrap; }
+    .msg .body { background:var(--panel); padding:8px 12px; border-radius:10px; display:inline-block; word-wrap:break-word; white-space:pre-wrap; }
     .msg.me { align-self:flex-end; text-align:right; }
     .msg.me .body { background:var(--accent); color:#111; }
     .system { align-self:center; font-size:12px; color:var(--muted); font-style:italic; }
     form#composer { display:flex; gap:8px; padding:12px 20px; background:var(--panel); border-top:1px solid #222; }
-    input { padding:10px 12px; border-radius:8px; border:1px solid #2a2e37;
-            background:#0d0f13; color:var(--text); font-size:14px; }
+    input { padding:10px 12px; border-radius:8px; border:1px solid #2a2e37; background:#0d0f13; color:var(--text); font-size:14px; }
     #composer input { flex:1; }
-    button { padding:10px 18px; border:0; border-radius:8px; background:var(--accent);
-             color:#111; font-weight:600; cursor:pointer; }
+    button { padding:10px 18px; border:0; border-radius:8px; background:var(--accent); color:#111; font-weight:600; cursor:pointer; }
     button:disabled { opacity:.5; cursor:not-allowed; }
-    #gate { position:fixed; inset:0; background:rgba(10,12,16,.96);
-            display:flex; align-items:center; justify-content:center; }
+    #gate { position:fixed; inset:0; background:rgba(10,12,16,.96); display:flex; align-items:center; justify-content:center; }
     #gate .card { background:var(--panel); padding:28px; border-radius:14px; width:320px; text-align:center; }
     #gate h1 { margin:0 0 4px; }
     #gate p { color:var(--muted); margin:0 0 18px; font-size:14px; }
     #gate form { display:flex; flex-direction:column; gap:10px; }
     #gate input { width:100%; }
+    .btnrow { display:flex; gap:8px; }
+    .btnrow button { flex:1; }
+    button.ghost { background:transparent; color:var(--muted); border:1px solid #2a2e37; font-weight:500; }
+    .error { color:var(--err); font-size:13px; min-height:16px; margin:2px 0 0; }
   </style>
 </head>
 <body>
-  <header>rustle <span class="dot">&#9679;</span> <span id="room">#general</span><span id="status">connecting&hellip;</span></header>
+  <header>rustle <span class="dot">&#9679;</span> <span id="room">#general</span><span id="status">not connected</span></header>
   <div id="main">
     <div id="log"></div>
     <aside id="sidebar">
@@ -61,11 +59,17 @@
   <div id="gate">
     <div class="card">
       <h1>rustle</h1>
-      <p>Pick a name and a room to join.</p>
-      <form id="joinForm">
-        <input id="nameInput" autocomplete="off" placeholder="Your name" maxlength="24" required>
-        <input id="roomInput" autocomplete="off" placeholder="Room (e.g. general)" maxlength="24" value="general">
-        <button type="submit">Join chat</button>
+      <p>Sign in, create an account, or join as a guest.</p>
+      <form id="joinForm" autocomplete="off">
+        <input id="nameInput" placeholder="Username" maxlength="24" required>
+        <input id="passInput" type="password" placeholder="Password" autocomplete="current-password">
+        <input id="roomInput" placeholder="Room (e.g. general)" maxlength="24" value="general">
+        <div class="btnrow">
+          <button type="button" id="loginBtn">Log in</button>
+          <button type="button" id="signupBtn">Sign up</button>
+        </div>
+        <button type="button" id="guestBtn" class="ghost">Continue as guest</button>
+        <p id="gateError" class="error"></p>
       </form>
     </div>
   </div>
@@ -74,12 +78,14 @@
     const $ = (id) => document.getElementById(id);
     const log = $('log'), status = $('status'), users = $('users'), count = $('count');
     const composer = $('composer'), input = $('input'), sendBtn = $('send');
-    const gate = $('gate'), joinForm = $('joinForm'), nameInput = $('nameInput'), roomInput = $('roomInput');
+    const gate = $('gate'), nameInput = $('nameInput'), passInput = $('passInput'), roomInput = $('roomInput');
 
-    let ws, myName, myRoom;
+    let ws, myName, myRoom, myToken = null;
 
     const escapeHtml = (s) => s.replace(/[&<>"']/g,
       c => ({ '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;' }[c]));
+
+    function showError(msg) { $('gateError').textContent = msg || ''; }
 
     function addMessage(name, body, ts, mine) {
       const el = document.createElement('div');
@@ -110,19 +116,45 @@
       }
     }
 
-    joinForm.addEventListener('submit', (e) => {
-      e.preventDefault();
+    async function authenticate(path) {
+      const username = nameInput.value.trim();
+      const password = passInput.value;
+      if (!username) { showError('Enter a username.'); return; }
+      showError('');
+      try {
+        const res = await fetch('/api/' + path, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ username, password }),
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) { showError(data.error || 'Request failed.'); return; }
+        myName = data.username;
+        myToken = data.token;
+        myRoom = roomInput.value.trim() || 'general';
+        connect();
+      } catch (e) {
+        showError('Network error.');
+      }
+    }
+
+    $('loginBtn').onclick = () => authenticate('login');
+    $('signupBtn').onclick = () => authenticate('register');
+    $('guestBtn').onclick = () => {
       myName = nameInput.value.trim();
-      myRoom = (roomInput.value.trim() || 'general');
-      if (myName) connect();
-    });
+      if (!myName) { showError('Enter a name to join as guest.'); return; }
+      myToken = null;
+      myRoom = roomInput.value.trim() || 'general';
+      connect();
+    };
 
     function connect() {
       const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-      ws = new WebSocket(`${proto}://${location.host}/ws`);
+      const base = `${proto}://${location.host}/ws`;
+      ws = new WebSocket(myToken ? `${base}?token=${encodeURIComponent(myToken)}` : base);
 
       ws.onopen = () => {
-        status.textContent = 'connected';
+        status.textContent = myToken ? `connected as ${myName}` : `connected as ${myName} (guest)`;
         ws.send(JSON.stringify({ type: 'join', room: myRoom, name: myName }));
         $('room').textContent = '#' + myRoom;
         gate.style.display = 'none';
