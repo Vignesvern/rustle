@@ -1,19 +1,17 @@
-//! WebSocket handling: one async task pair per connected client.
+//! WebSocket handling: one async task pair per connected client, now room-aware.
 //!
 //! ## The model (with Go analogies)
 //!
-//! * `broadcast::Sender` ≈ a Go channel that fans out to *every* subscriber. Send once,
-//!   every connected client receives a copy.
+//! * A room's `broadcast::Sender` ≈ a Go channel that fans out to *every* subscriber.
 //! * `tokio::spawn` ≈ `go func()` — it launches a lightweight async task.
-//! * `tokio::select!` ≈ Go's `select {}` — it waits on multiple futures and acts on
-//!   whichever finishes first.
+//! * `tokio::select!` ≈ Go's `select {}` — it acts on whichever future finishes first.
 //!
-//! Each client gets **two** tasks:
-//! 1. write task: the broadcast channel is drained into this client's socket (fan-out).
-//! 2. read task: this client's socket is drained into the broadcast channel.
+//! Each client runs two tasks:
+//! 1. write task: the room's broadcast channel is drained into this client's socket.
+//! 2. read task: this client's socket is drained into the room's broadcast channel.
 //!
-//! When either task ends (the browser closed the tab, or the send failed), `select!`
-//! wakes up and we abort the other task so nothing leaks.
+//! When either ends (the tab closed), `select!` aborts the other, we leave the room, and
+//! we broadcast a "left" notice plus a refreshed roster to whoever remains.
 
 use axum::{
     extract::{
@@ -23,67 +21,80 @@ use axum::{
     response::IntoResponse,
 };
 use futures_util::{SinkExt, StreamExt};
+use tokio::sync::broadcast::error::RecvError;
 
 use crate::AppState;
 use crate::message::{ClientMessage, ServerMessage};
 
-/// Axum handler for `GET /ws`. Performs the HTTP→WebSocket upgrade handshake, then
-/// hands the live socket to `handle_socket`. `on_upgrade` returns immediately; the
-/// closure runs in the background once the upgrade completes.
+/// Axum handler for `GET /ws`: performs the HTTP→WebSocket upgrade, then hands the live
+/// socket to `handle_socket` to run for the connection's lifetime.
 pub async fn ws_handler(ws: WebSocketUpgrade, State(state): State<AppState>) -> impl IntoResponse {
     ws.on_upgrade(move |socket| handle_socket(socket, state))
 }
 
-/// Drives a single client connection for its entire lifetime.
 async fn handle_socket(socket: WebSocket, state: AppState) {
-    // Split the socket into a write half (`sink`) and a read half (`stream`) so the two
-    // tasks below can own them independently. `.split()` comes from the StreamExt trait.
     let (mut sink, mut stream) = socket.split();
 
-    // Subscribe *before* doing anything else so we don't miss messages sent while we're
-    // still setting up. Every subscriber gets its own receiver.
-    let mut rx = state.tx.subscribe();
-
-    // Protocol rule: the first valid message must be a `join` that gives us a name.
-    // We loop until we get one (ignoring stray frames), or the client disconnects.
-    let name = loop {
+    // Protocol rule: the first valid frame must be a `join` giving us a room + name.
+    // We loop until we get a usable one, or the client disconnects.
+    let (room, name) = loop {
         match stream.next().await {
             Some(Ok(Message::Text(text))) => {
-                if let Ok(ClientMessage::Join { name }) = serde_json::from_str(text.as_str()) {
-                    break name;
+                if let Ok(ClientMessage::Join { room, name }) = serde_json::from_str(text.as_str())
+                {
+                    let room = room.trim();
+                    let name = name.trim();
+                    if !name.is_empty() {
+                        // Default an empty room name to "general".
+                        let room = if room.is_empty() { "general" } else { room };
+                        break (room.to_owned(), name.to_owned());
+                    }
                 }
-                // Not a join yet — keep waiting.
             }
             Some(Ok(_)) => {} // ignore ping/pong/binary before join
-            _ => return,      // stream closed or errored before joining: nothing to clean up
+            _ => return,      // closed before joining: nothing to clean up
         }
     };
 
-    tracing::info!(%name, "client joined");
+    let conn_id = state.hub.next_conn_id();
 
-    // Tell everyone (including this client) that someone joined.
-    let _ = state
-        .tx
-        .send(ServerMessage::system(format!("{name} joined")));
+    // Register in the room and subscribe. `join` returns our receiver + the new roster.
+    let (mut rx, roster) = state.hub.join(&room, conn_id, name.clone());
+    tracing::info!(%name, %room, "client joined");
 
-    // --- Write task: broadcast channel -> this browser --------------------------------
+    // Announce the join and push the refreshed roster to everyone in the room.
+    state.hub.broadcast(
+        &room,
+        ServerMessage::system(&room, format!("{name} joined")),
+    );
+    state
+        .hub
+        .broadcast(&room, ServerMessage::presence(&room, roster));
+
+    // --- Write task: room broadcast -> this browser -----------------------------------
     let mut write_task = tokio::spawn(async move {
-        // `rx.recv()` yields the next broadcast message. It errors only when the channel
-        // is closed or this receiver lagged too far behind; either way we stop.
-        while let Ok(msg) = rx.recv().await {
-            let json = match serde_json::to_string(&msg) {
-                Ok(j) => j,
-                Err(_) => continue,
-            };
-            // If the send fails, the browser is gone — end the task.
-            if sink.send(Message::Text(json.into())).await.is_err() {
-                break;
+        loop {
+            match rx.recv().await {
+                Ok(msg) => {
+                    let Ok(json) = serde_json::to_string(&msg) else {
+                        continue;
+                    };
+                    // If the send fails, the browser is gone — end the task.
+                    if sink.send(Message::Text(json.into())).await.is_err() {
+                        break;
+                    }
+                }
+                // Slow client fell behind the buffer: skip the dropped messages rather
+                // than dropping the connection.
+                Err(RecvError::Lagged(_)) => continue,
+                Err(RecvError::Closed) => break,
             }
         }
     });
 
-    // --- Read task: this browser -> broadcast channel ---------------------------------
-    let tx = state.tx.clone();
+    // --- Read task: this browser -> room broadcast ------------------------------------
+    let hub = state.hub.clone();
+    let read_room = room.clone();
     let author = name.clone();
     let mut read_task = tokio::spawn(async move {
         while let Some(Ok(msg)) = stream.next().await {
@@ -95,20 +106,29 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                 if body.is_empty() {
                     continue;
                 }
-                // Broadcast to everyone. `send` errors only if there are no receivers,
-                // which can't happen here (we hold one), so ignoring the result is fine.
-                let _ = tx.send(ServerMessage::chat(author.clone(), body));
+                hub.broadcast(
+                    &read_room,
+                    ServerMessage::chat(&read_room, author.clone(), body),
+                );
             }
         }
     });
 
-    // Wait for whichever task finishes first, then abort the other. This is the graceful
-    // teardown: if the browser disconnects, `read_task` ends -> we abort `write_task`.
+    // Whichever task finishes first, abort the other — graceful teardown.
     tokio::select! {
         _ = &mut write_task => read_task.abort(),
         _ = &mut read_task => write_task.abort(),
     }
 
-    tracing::info!(%name, "client left");
-    let _ = state.tx.send(ServerMessage::system(format!("{name} left")));
+    tracing::info!(%name, %room, "client left");
+
+    // Leave the room; if anyone remains, tell them and refresh the roster.
+    if let Some(roster) = state.hub.leave(&room, conn_id) {
+        state
+            .hub
+            .broadcast(&room, ServerMessage::system(&room, format!("{name} left")));
+        state
+            .hub
+            .broadcast(&room, ServerMessage::presence(&room, roster));
+    }
 }
