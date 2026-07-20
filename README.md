@@ -1,8 +1,9 @@
 # rustle
 
 A real-time chat service written in **Rust** — WebSocket-based, with per-room broadcast
-fan-out, live presence, configurable limits, and an integration test suite. Built with
-[`axum`](https://github.com/tokio-rs/axum) and [`tokio`](https://tokio.rs).
+fan-out, live presence, configurable limits, optional Postgres persistence, and an
+integration test suite. Built with [`axum`](https://github.com/tokio-rs/axum) and
+[`tokio`](https://tokio.rs).
 
 > Portfolio project. Built incrementally in milestones; see the roadmap below.
 
@@ -11,7 +12,8 @@ fan-out, live presence, configurable limits, and an integration test suite. Buil
 Open the app in two browser tabs, pick a name and a room, and chat in real time.
 Messages are fanned out to everyone **in the same room**; join/leave events show up as
 system notices, and a live "online" roster tracks who's present. Messages are size-capped
-and rate-limited per connection.
+and rate-limited per connection. With a database configured, recent history is replayed to
+clients when they join.
 
 ## Run it
 
@@ -20,7 +22,18 @@ cargo run
 # then open http://localhost:3000 in two browser tabs
 ```
 
-Set `RUST_LOG=rustle=debug` for verbose logs.
+Set `RUST_LOG=rustle=debug` for verbose logs. Without a database it runs fully in-memory.
+
+### With persistence (Postgres)
+
+```bash
+docker compose up -d
+export DATABASE_URL=postgres://rustle:rustle@localhost:5432/rustle
+cargo run
+```
+
+Migrations in [`migrations/`](migrations/) run automatically on startup. Recent messages
+are then replayed to clients on join (up to `RUSTLE_HISTORY_LIMIT`).
 
 ## How it works
 
@@ -31,7 +44,7 @@ channel and member roster — a `HashMap` guarded by an `RwLock`, shared across 
 via `Arc`. Each connection runs **two async tasks**:
 
 - a **read task** — parses incoming frames and publishes them to its room's channel
-  (enforcing the size cap and rate limit)
+  (enforcing the size cap and rate limit, and persisting to Postgres if configured)
 - a **write task** — forwards that room's broadcast messages, plus any private notices,
   out to the client's socket
 
@@ -41,6 +54,8 @@ broadcast to whoever remains.
 
 ```
 browser ──ws──▶ read task ──▶ room broadcast::Sender ──▶ write task ──ws──▶ same-room browsers
+                    │
+                    └──▶ Postgres (optional): persist + replay recent history on join
 ```
 
 ## HTTP API
@@ -76,6 +91,8 @@ All settings are environment variables with sensible defaults (see [`config.rs`]
 | Variable                        | Default | Meaning                                |
 |---------------------------------|---------|----------------------------------------|
 | `RUSTLE_ADDR`                   | `0.0.0.0:3000` | Bind address                    |
+| `DATABASE_URL`                  | *(unset)* | Postgres URL; unset = no persistence |
+| `RUSTLE_HISTORY_LIMIT`          | `50`    | Messages replayed to a client on join  |
 | `RUSTLE_MAX_MESSAGE_BYTES`      | `4096`  | Max chat message size                  |
 | `RUSTLE_MAX_NAME_LEN`           | `24`    | Max display-name length (chars)        |
 | `RUSTLE_MAX_ROOM_LEN`           | `24`    | Max room-name length (chars)           |
@@ -93,18 +110,19 @@ cargo fmt --check
 
 The suite spins up the server on an ephemeral port and drives it with real
 `tokio-tungstenite` clients (broadcast, room isolation, presence, rate limiting, size
-limits) and exercises the HTTP endpoints via axum's `oneshot`.
+limits) and exercises the HTTP endpoints via axum's `oneshot`. The persistence test runs
+only when `DATABASE_URL` is set (otherwise it skips).
 
 ## Tech stack
 
-`tokio` · `axum` (WebSockets) · `serde` / `serde_json` · `tracing` · `tower-http` ·
-`thiserror` · `tokio-tungstenite` (tests)
+`tokio` · `axum` (WebSockets) · `serde` / `serde_json` · `sqlx` (Postgres) · `tracing` ·
+`tower-http` · `thiserror` · `tokio-tungstenite` (tests)
 
 ## Roadmap
 
 - [x] **M1** — single-room broadcast chat + web client
 - [x] **M2** — multiple rooms + presence
 - [x] **M3** — config, rate limiting, size limits, HTTP API, integration tests
-- [ ] **M4** — Postgres persistence + message history
+- [x] **M4** — Postgres persistence + message history
 - [ ] **M5** — accounts + JWT auth
 - [ ] **M6** — Docker, CI, deploy
