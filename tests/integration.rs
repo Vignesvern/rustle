@@ -311,3 +311,152 @@ async fn history_is_replayed_on_join() {
         .await
         .unwrap();
 }
+
+// --- Auth ---------------------------------------------------------------------------
+
+use axum::Router;
+
+fn json_post(uri: &str, body: Value) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap()
+}
+
+async fn call(app: Router, req: Request<Body>) -> (StatusCode, Value) {
+    let resp = app.oneshot(req).await.unwrap();
+    let status = resp.status();
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let v: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+    (status, v)
+}
+
+#[tokio::test]
+async fn invalid_token_is_rejected() {
+    // Token verification is stateless, so this needs no database.
+    let addr = spawn(Config::default()).await;
+    let res = connect_async(format!("ws://{addr}/ws?token=not-a-real-token")).await;
+    assert!(
+        res.is_err(),
+        "an invalid token must be rejected at the handshake"
+    );
+}
+
+#[tokio::test]
+async fn register_login_and_authenticated_identity() {
+    let Ok(url) = std::env::var("DATABASE_URL") else {
+        eprintln!("skipping register_login_and_authenticated_identity: DATABASE_URL not set");
+        return;
+    };
+    let pool = rustle::db::init(&url).await.expect("db init");
+    let uname = "m5_alice";
+    let room = "m5-room";
+    sqlx::query("DELETE FROM users WHERE username = $1")
+        .bind(uname)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM messages WHERE room = $1")
+        .bind(room)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let state = AppState::new(Config::default()).with_db(Some(pool.clone()));
+
+    // Register -> 200 + token.
+    let (st, body) = call(
+        build_app(state.clone()),
+        json_post(
+            "/api/register",
+            json!({"username": uname, "password": "secret1"}),
+        ),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(body["username"], uname);
+    assert!(body["token"].as_str().is_some());
+
+    // Registering the same name again -> 409.
+    let (st, _) = call(
+        build_app(state.clone()),
+        json_post(
+            "/api/register",
+            json!({"username": uname, "password": "secret1"}),
+        ),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CONFLICT);
+
+    // Wrong password -> 401.
+    let (st, _) = call(
+        build_app(state.clone()),
+        json_post(
+            "/api/login",
+            json!({"username": uname, "password": "WRONG"}),
+        ),
+    )
+    .await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED);
+
+    // Correct login -> token.
+    let (st, body) = call(
+        build_app(state.clone()),
+        json_post(
+            "/api/login",
+            json!({"username": uname, "password": "secret1"}),
+        ),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let token = body["token"].as_str().unwrap().to_owned();
+
+    // An authenticated client's identity comes from the token, not the client-sent name.
+    let addr = spawn_state(state).await;
+    let (mut alice, _) = connect_async(format!("ws://{addr}/ws?token={token}"))
+        .await
+        .unwrap();
+    alice
+        .send(WsMessage::Text(
+            json!({"type": "join", "room": room, "name": "IMPOSTER"})
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+
+    let mut bob = join(addr, room, "bob").await; // guest
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    drain(&mut bob).await;
+
+    alice
+        .send(WsMessage::Text(
+            json!({"type": "message", "body": "hi"}).to_string().into(),
+        ))
+        .await
+        .unwrap();
+    let got = recv_until(&mut bob, |m| is_msg(m, "hi"))
+        .await
+        .expect("bob should receive the message");
+    assert_eq!(
+        got["name"], uname,
+        "authenticated identity must come from the token, not the client"
+    );
+
+    let _ = alice.close(None).await;
+    let _ = bob.close(None).await;
+    sqlx::query("DELETE FROM users WHERE username = $1")
+        .bind(uname)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM messages WHERE room = $1")
+        .bind(room)
+        .execute(&pool)
+        .await
+        .unwrap();
+}

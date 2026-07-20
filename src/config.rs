@@ -1,7 +1,4 @@
 //! Runtime configuration, read from environment variables with sensible defaults.
-//!
-//! Every knob has an env var and a default, so the server runs with zero configuration
-//! but is fully tunable in production without recompiling.
 
 use std::time::Duration;
 
@@ -13,6 +10,10 @@ pub struct Config {
     pub database_url: Option<String>,
     /// How many recent messages to replay to a client when it joins a room.
     pub history_limit: usize,
+    /// Secret used to sign/verify JWTs.
+    pub jwt_secret: String,
+    /// JWT lifetime, in seconds.
+    pub jwt_ttl_secs: u64,
     /// Maximum size of a single chat message body, in bytes.
     pub max_message_bytes: usize,
     /// Maximum length (in characters) of a display name.
@@ -33,6 +34,8 @@ impl Default for Config {
             addr: "0.0.0.0:3000".to_owned(),
             database_url: None,
             history_limit: 50,
+            jwt_secret: "dev-insecure-secret-change-me".to_owned(),
+            jwt_ttl_secs: 86_400,
             max_message_bytes: 4096,
             max_name_len: 24,
             max_room_len: 24,
@@ -51,6 +54,8 @@ impl Config {
             addr: env_or("RUSTLE_ADDR", d.addr),
             database_url: std::env::var("DATABASE_URL").ok(),
             history_limit: env_or("RUSTLE_HISTORY_LIMIT", d.history_limit),
+            jwt_secret: std::env::var("RUSTLE_JWT_SECRET").unwrap_or(d.jwt_secret),
+            jwt_ttl_secs: env_or("RUSTLE_JWT_TTL_SECS", d.jwt_ttl_secs),
             max_message_bytes: env_or("RUSTLE_MAX_MESSAGE_BYTES", d.max_message_bytes),
             max_name_len: env_or("RUSTLE_MAX_NAME_LEN", d.max_name_len),
             max_room_len: env_or("RUSTLE_MAX_ROOM_LEN", d.max_room_len),

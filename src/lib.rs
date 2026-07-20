@@ -3,6 +3,7 @@
 //! The building blocks live in the library so that both the binary (`main.rs`) and the
 //! integration tests can construct and drive the same app via [`build_app`].
 
+pub mod auth;
 pub mod config;
 pub mod db;
 pub mod error;
@@ -13,7 +14,10 @@ pub mod ws;
 
 use std::sync::Arc;
 
-use axum::{Router, routing::get};
+use axum::{
+    Router,
+    routing::{get, post},
+};
 use sqlx::PgPool;
 use tower_http::{services::ServeDir, trace::TraceLayer};
 
@@ -51,6 +55,8 @@ impl AppState {
 pub fn build_app(state: AppState) -> Router {
     Router::new()
         .route("/health", get(routes::health))
+        .route("/api/register", post(routes::register))
+        .route("/api/login", post(routes::login))
         .route("/api/rooms", get(routes::list_rooms))
         .route("/api/rooms/{name}", get(routes::room_detail))
         .route("/ws", get(ws::ws_handler))
